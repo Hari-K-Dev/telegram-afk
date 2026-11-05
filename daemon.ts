@@ -6,14 +6,15 @@
 import { Bot, GrammyError, InlineKeyboard, InputFile } from 'grammy'
 import { createConnection, createServer, type Socket } from 'node:net'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import {
-  CONFIG_DIR, ENV_PATH, INBOX_DIR, SOCKET_PATH, STATE_PATH,
+  CONFIG_DIR, ENV_PATH, INBOX_DIR, JARVIS_BIN, OUTBOX_DIR, SOCKET_PATH, STATE_PATH,
   encode, lineReader, type FromDaemon, type ToDaemon,
 } from './shared.ts'
 
-type CtlMessage = { type: 'pair'; code: string } | { type: 'status' } | { type: 'afk'; on: boolean }
+type CtlMessage = { type: 'pair'; code: string } | { type: 'status' } | { type: 'afk'; on: boolean } | { type: 'voicetest' }
 
 type State = {
   owner_id?: number
@@ -30,6 +31,7 @@ type Session = {
   pid: number
   thread_id: number // 0 means no topic (fallback: prefixed messages in the main chat)
   repliedSinceStop: boolean
+  lastReply: string // what the reply tool last sent this turn, which is what a voice note should say
 }
 
 const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
@@ -38,6 +40,7 @@ const log = (...a: unknown[]) => console.error(new Date().toISOString(), ...a)
 
 mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 })
 mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(OUTBOX_DIR, { recursive: true, mode: 0o700 })
 
 function readToken(): string {
   if (process.env.TELEGRAM_BOT_TOKEN) return process.env.TELEGRAM_BOT_TOKEN
@@ -150,11 +153,105 @@ async function sendFile(thread_id: number, path: string) {
     : enqueue(() => bot.api.sendDocument(chat, file, threadOpts(thread_id)))
 }
 
-// ---------- AFK mode ----------
+// ---------- voice (jarvis-voice, optional: everything falls back to text without it) ----------
+
+const NOTE_TIMEOUT_MS = 90_000
+const TRANSCRIBE_TIMEOUT_MS = 120_000
+const CAPTION_LIMIT = 1024
+
+// launchd starts this daemon with a minimal PATH, which has neither ffmpeg nor claude.
+const childEnv = {
+  ...process.env,
+  PATH: ['/opt/homebrew/bin', '/usr/local/bin', join(homedir(), '.local', 'bin'), process.env.PATH ?? ''].join(':'),
+}
+
+// Runs jarvis from a neutral folder and returns stdout, or null on any failure.
+// Logs only the exit code: stdout and stderr can hold the words of a message.
+async function jarvis(args: string[], input: string | undefined, timeoutMs: number): Promise<string | null> {
+  if (!existsSync(JARVIS_BIN)) return null
+  try {
+    const p = Bun.spawn([JARVIS_BIN, ...args], {
+      cwd: CONFIG_DIR,
+      env: childEnv,
+      stdin: input === undefined ? 'ignore' : new TextEncoder().encode(input),
+      stdout: 'pipe',
+      stderr: 'ignore',
+    })
+    const timer = setTimeout(() => p.kill(), timeoutMs)
+    const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited])
+    clearTimeout(timer)
+    if (code !== 0) {
+      log(`jarvis ${args[0]} exited ${code}`)
+      return null
+    }
+    return out.trim()
+  } catch (err) {
+    log(`jarvis ${args[0]} failed:`, err instanceof Error ? err.name : 'unknown')
+    return null
+  }
+}
+
+// The Mac's speakers follow AFK mode, so nothing talks to an empty room.
+function syncSpeakers() {
+  void jarvis(['away', state.afk ? 'on' : 'off'], undefined, 10_000)
+}
 
 function setAfk(on: boolean) {
   state.afk = on
   saveState()
+  syncSpeakers()
+}
+
+type NotePayload = { last_assistant_message: string; session_id?: string; transcript_path?: string; cwd?: string }
+
+// Sends a voice note. Returns null if it could not, and the caller then relies on text.
+async function sendVoiceNote(thread_id: number, payload: NotePayload): Promise<{ complete: boolean } | null> {
+  const chat = targetChat()
+  if (!chat) return null
+  const path = join(OUTBOX_DIR, `${randomBytes(8).toString('hex')}.ogg`)
+  try {
+    const out = await jarvis(['note', path], JSON.stringify(payload), NOTE_TIMEOUT_MS)
+    if (out === null) return null
+    const note = JSON.parse(out) as { caption: string; duration: number; complete: boolean }
+    await enqueue(() => bot.api.sendVoice(chat, new InputFile(path), {
+      ...threadOpts(thread_id),
+      caption: note.caption.slice(0, CAPTION_LIMIT),
+      duration: note.duration,
+    }))
+    return { complete: note.complete }
+  } catch (err) {
+    log('voice note not sent:', err instanceof Error ? err.message : err)
+    return null
+  } finally {
+    try { unlinkSync(path) } catch {}
+  }
+}
+
+// A voice note in a topic: transcribe on this Mac and hand the session text. The
+// words are echoed back so a mishearing is visible on the phone before it matters.
+// Never treated as an approval: those stay on the buttons, where nothing can be misheard.
+async function handleVoiceNote(fileId: string, caption: string, message_id: number, from: string, thread_id: number | undefined, reply: (t: string) => Promise<unknown>) {
+  let path: string | undefined
+  try {
+    path = await download(fileId, 'voice.ogg')
+    const heard = await jarvis(['transcribe', path], undefined, TRANSCRIBE_TIMEOUT_MS)
+    if (!heard) {
+      await reply("Couldn't make out that voice note, so the session didn't get it. Try again or type it.")
+      return
+    }
+    const s = sessionForThread(thread_id)
+    if (!s) {
+      await reply('That session has ended, so it did not get your voice note.')
+      return
+    }
+    await reply(`Heard: ${heard}`)
+    const text = `[Voice note, machine transcribed, may contain errors] ${caption ? caption + '\n' : ''}${heard}`
+    send(s, { type: 'inbound', text, message_id, from, files: [] })
+  } catch (err) {
+    await reply(`Couldn't fetch the voice note: ${err instanceof Error ? err.message : err}`)
+  } finally {
+    if (path) try { unlinkSync(path) } catch {}
+  }
 }
 
 // ---------- topics ----------
@@ -201,7 +298,7 @@ async function handle(sock: Socket, msg: ToDaemon | CtlMessage, self: { session?
     case 'register': {
       const name = uniqueName(msg.name)
       const thread_id = await topicFor(name)
-      const s: Session = { sock, name, cwd: msg.cwd, pid: msg.pid, thread_id, repliedSinceStop: false }
+      const s: Session = { sock, name, cwd: msg.cwd, pid: msg.pid, thread_id, repliedSinceStop: false, lastReply: '' }
       sessions.add(s)
       self.session = s
       send(s, { type: 'registered', name, thread_id })
@@ -218,6 +315,7 @@ async function handle(sock: Socket, msg: ToDaemon | CtlMessage, self: { session?
         if (msg.text?.trim()) await sendText(s.thread_id, label(s) + msg.text)
         for (const f of msg.files ?? []) await sendFile(s.thread_id, f)
         s.repliedSinceStop = true
+        if (msg.text?.trim()) s.lastReply = msg.text
         send(s, { type: 'ack', id: msg.id, ok: true })
       } catch (err) {
         send(s, { type: 'ack', id: msg.id, ok: false, error: err instanceof Error ? err.message : String(err) })
@@ -242,14 +340,29 @@ async function handle(sock: Socket, msg: ToDaemon | CtlMessage, self: { session?
       const s = [...sessions].find(x => msg.pids.includes(x.pid))
       sock.end()
       if (!s || !state.afk || !targetChat()) {
-        if (s && msg.event === 'Stop') s.repliedSinceStop = false
+        if (s && msg.event === 'Stop') {
+          s.repliedSinceStop = false
+          s.lastReply = ''
+        }
         return
       }
       if (msg.event === 'Stop') {
-        // Skip the summary if Claude already replied on Telegram this turn.
+        // Reset before any waiting: the next turn may start while the note is being made.
         const replied = s.repliedSinceStop
+        const spoken = replied ? s.lastReply : msg.message ?? ''
         s.repliedSinceStop = false
-        if (!replied && msg.message?.trim()) {
+        s.lastReply = ''
+        // A deliberate reply still gets a voice note, because answers to phone messages
+        // normally go that way. It just doesn't get a second copy of the text.
+        const note = spoken.trim()
+          ? await sendVoiceNote(s.thread_id, {
+              last_assistant_message: spoken,
+              session_id: msg.session_id,
+              transcript_path: msg.transcript_path,
+              cwd: msg.cwd || s.cwd,
+            })
+          : null
+        if (!replied && msg.message?.trim() && !note?.complete) {
           const body = msg.message.length > 3000 ? msg.message.slice(0, 3000) + '\n…' : msg.message
           await sendText(s.thread_id, `${label(s)}✅ Turn finished\n\n${body}`).catch(() => {})
         }
@@ -280,6 +393,11 @@ async function handle(sock: Socket, msg: ToDaemon | CtlMessage, self: { session?
     case 'afk': {
       setAfk(msg.on)
       sock.end(JSON.stringify({ ok: true, afk: state.afk }) + '\n')
+      return
+    }
+    case 'voicetest': {
+      const note = await sendVoiceNote(0, { last_assistant_message: VOICE_TEST })
+      sock.end(JSON.stringify(note ? { ok: true } : { ok: false, error: 'No voice note. Check ~/.config/claude-tg/tgd.log and `jarvis status`.' }) + '\n')
       return
     }
   }
@@ -320,6 +438,7 @@ async function startSocket() {
 
 // ---------- Telegram inbound ----------
 
+const VOICE_TEST = 'Voice notes are working. This is what a finished session will sound like.'
 const VERDICT_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 function sessionForThread(thread_id: number | undefined): Session | undefined {
@@ -363,16 +482,24 @@ bot.on('message', async ctx => {
 
   const cmd = text.trim().split(/\s+/)[0]?.toLowerCase().replace(/@\w+$/, '')
   if (cmd === '/sessions' || cmd === '/start' || cmd === '/help') {
-    await reply(`${sessionList()}\n\nAFK mode: ${state.afk ? 'on' : 'off'}\n/afk  post an update here when a session finishes a turn\n/back  stop automatic updates`)
+    await reply(`${sessionList()}\n\nAFK mode: ${state.afk ? 'on' : 'off'}\n/afk  voice notes and updates here, Mac speakers off\n/back  stop automatic updates, Mac speakers on\n/voicetest  send a sample voice note here`)
     return
   }
   if (cmd === '/afk' || cmd === '/back') {
     setAfk(cmd === '/afk')
     await reply(state.afk
-      ? 'AFK mode on. Each session will post an update here when it finishes a turn.'
-      : 'AFK mode off.')
+      ? 'AFK mode on. Each session will send a voice note and update here when it finishes a turn. The Mac stays quiet.'
+      : 'AFK mode off. The voice is back on the Mac.')
     return
   }
+  if (cmd === '/voicetest') {
+    // Not awaited, because updates are handled one at a time and this takes seconds.
+    void sendVoiceNote(thread_id ?? 0, { last_assistant_message: VOICE_TEST }).then(note => {
+      if (!note) return reply('No voice note. Check ~/.config/claude-tg/tgd.log and `jarvis status` on the Mac.')
+    })
+    return
+  }
+
   const s = sessionForThread(thread_id)
   if (!s) {
     await reply(thread_id
@@ -385,6 +512,13 @@ bot.on('message', async ctx => {
   if (v) {
     send(s, { type: 'verdict', request_id: v[2]!.toLowerCase(), behavior: v[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny' })
     await ctx.react('👍').catch(() => {})
+    return
+  }
+
+  // Also not awaited, so an Allow or Deny tap isn't held up by the transcription.
+  if (ctx.message.voice) {
+    void handleVoiceNote(ctx.message.voice.file_id, ctx.message.caption ?? '', ctx.message.message_id, from.first_name, thread_id, reply)
+    await ctx.react('👀').catch(() => {})
     return
   }
 
@@ -421,12 +555,14 @@ bot.catch(err => log('bot error:', err.message))
 // ---------- start ----------
 
 await startSocket()
+syncSpeakers() // so a crash during AFK mode can't leave the Mac silent or talking
 const me = await bot.api.getMe()
 log(`bot @${me.username} ready${state.owner_id ? `, paired with ${state.owner_name}` : ', waiting for pairing (DM the bot)'}`)
 await bot.api.setMyCommands([
   { command: 'sessions', description: 'List live Claude sessions' },
   { command: 'afk', description: 'Send me updates when sessions finish' },
   { command: 'back', description: 'Stop automatic updates' },
+  { command: 'voicetest', description: 'Send a sample voice note here' },
 ]).catch(() => {})
 
 const shutdown = () => {

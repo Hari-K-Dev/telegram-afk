@@ -5,6 +5,7 @@
 //   bun ctl.ts pair <CODE>    approve your Telegram account (code from DMing the bot)
 //   bun ctl.ts status         show pairing, AFK mode and live sessions
 //   bun ctl.ts afk on|off     toggle automatic end-of-turn updates
+//   bun ctl.ts voicetest      send a sample voice note to the main chat
 import { createConnection } from 'node:net'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { CONFIG_DIR, ENV_PATH, SOCKET_PATH, START_HINT } from './shared.ts'
@@ -58,8 +59,13 @@ async function main() {
       console.log(`AFK mode ${r.afk ? 'on' : 'off'}.`)
       return
     }
+    case 'voicetest': {
+      const r = await call({ type: 'voicetest' })
+      console.log(r.ok ? 'Voice note sent.' : r.error)
+      return
+    }
     default:
-      console.log('Usage: bun ctl.ts token | pair <CODE> | status | afk on|off')
+      console.log('Usage: bun ctl.ts token | pair <CODE> | status | afk on|off | voicetest')
   }
 }
 

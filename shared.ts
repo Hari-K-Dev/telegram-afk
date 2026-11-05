@@ -8,6 +8,8 @@ export const SOCKET_PATH = join(CONFIG_DIR, 'tgd.sock')
 export const STATE_PATH = join(CONFIG_DIR, 'state.json')
 export const ENV_PATH = join(CONFIG_DIR, '.env')
 export const INBOX_DIR = join(CONFIG_DIR, 'inbox')
+export const OUTBOX_DIR = join(CONFIG_DIR, 'outbox')
+export const JARVIS_BIN = process.env.JARVIS_BIN ?? join(homedir(), '.local', 'bin', 'jarvis')
 // The launchd label from the plist you installed; only used in hints.
 export const LAUNCHD_LABEL = process.env.CLAUDE_TG_LABEL ?? 'io.github.hari-k-dev.telegram-afk'
 export const START_HINT = `Start it with: launchctl kickstart -k gui/$(id -u)/${LAUNCHD_LABEL}`
