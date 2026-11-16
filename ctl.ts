@@ -7,7 +7,7 @@
 //   bun ctl.ts afk on|off     toggle automatic end-of-turn updates
 //   bun ctl.ts voicetest      send a sample voice note to the main chat
 import { createConnection } from 'node:net'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { CONFIG_DIR, ENV_PATH, SOCKET_PATH, START_HINT } from './shared.ts'
 
 const [cmd, arg] = process.argv.slice(2)
@@ -34,12 +34,16 @@ async function main() {
       } else {
         process.stdout.write('Paste the bot token from BotFather (input hidden): ')
         Bun.spawnSync(['stty', '-echo'], { stdin: 'inherit' })
-        for await (const line of console) { token = line.trim(); break }
-        Bun.spawnSync(['stty', 'echo'], { stdin: 'inherit' })
-        process.stdout.write('\n')
+        try {
+          for await (const line of console) { token = line.trim(); break }
+        } finally {
+          Bun.spawnSync(['stty', 'echo'], { stdin: 'inherit' })
+          process.stdout.write('\n')
+        }
       }
       if (!/^\d+:[\w-]{30,}$/.test(token)) throw new Error("That doesn't look like a bot token (expected 123456:ABC...).")
       mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 })
+      chmodSync(CONFIG_DIR, 0o700)
       writeFileSync(ENV_PATH, `TELEGRAM_BOT_TOKEN=${token}\n`, { mode: 0o600 })
       console.log(`Saved to ${ENV_PATH} (owner-only). Restart the daemon to use it.`)
       return
@@ -47,7 +51,7 @@ async function main() {
     case 'pair': {
       if (!arg) throw new Error('Usage: bun ctl.ts pair <CODE>')
       const r = await call({ type: 'pair', code: arg })
-      console.log(r.ok ? `Paired with ${r.owner}.` : r.error)
+      console.log(r.ok ? `Paired with ${r.owner} (Telegram user ${r.owner_id}).` : r.error)
       return
     }
     case 'status':

@@ -24,7 +24,7 @@ export type ToDaemon =
 export type FromDaemon =
   | { type: 'registered'; name: string; thread_id: number }
   | { type: 'ack'; id: number; ok: boolean; error?: string }
-  | { type: 'inbound'; text: string; message_id: number; from: string; files: string[] }
+  | { type: 'inbound'; text: string; message_id: number; from: string; files: string[]; forwarded?: string }
   | { type: 'verdict'; request_id: string; behavior: 'allow' | 'deny' }
 
 export function encode(msg: ToDaemon | FromDaemon): string {
