@@ -1,1 +1,14 @@
 node_modules
+# Secrets and runtime state normally live in ~/.config/claude-tg, never here.
+# These lines are a safety net in case CLAUDE_TG_DIR points into the repo.
+.env
+.env.*
+state.json
+state.json.tmp
+*.log
+*.sock
+inbox/
+outbox/
+mcp.json
+*.plist
+!*.plist.example

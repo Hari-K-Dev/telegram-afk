@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram-afk": {
+      "command": "__BUN__",
+      "args": ["__REPO__/channel.ts"]
+    }
+  }
+}
